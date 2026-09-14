@@ -57,8 +57,20 @@ async function callGeminiSafe(prompt: string, schema: any, taskName: string): Pr
   const ai = getGenAI();
   if (!ai) return null;
 
-  // Primary fast tier: gemini-3.1-flash-lite (high quota availability & low latency)
-  const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash'];
+  // Optimal tiering matched to user's highest quota:
+  // 1. gemini-3.1-flash-lite (500 RPD, 15 RPM, 250k TPM)
+  // 2. gemini-3.5-flash-lite (500 RPD, 15 RPM, 250k TPM)
+  // 3. gemini-3.7-flash, gemini-3.5-flash, gemini-2.5-flash (20 RPD fallbacks)
+  const customModel = process.env.GEMINI_MODEL;
+  const modelsToTry = [
+    ...(customModel ? [customModel] : []),
+    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-3.7-flash',
+    'gemini-3.5-flash',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+  ];
 
   for (const model of modelsToTry) {
     try {
@@ -985,17 +997,22 @@ Extract:
 // OAuth Configuration for Client-Side Google Identity Services
 // ----------------------------------------------------
 app.get('/api/oauth-config', (req, res) => {
-  let clientId = '192992717479-ocaonobk699q4r97dsh8fqgj10dg0n7p.apps.googleusercontent.com';
-  try {
-    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      if (parsed.oAuthClientId) {
-        clientId = parsed.oAuthClientId;
+  let clientId = process.env.GOOGLE_CLIENT_ID || process.env.OAUTH_CLIENT_ID || '';
+  if (!clientId) {
+    try {
+      const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(configPath)) {
+        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        if (parsed.oAuthClientId) {
+          clientId = parsed.oAuthClientId;
+        }
       }
+    } catch (err) {
+      // fallback
     }
-  } catch (err) {
-    // fallback to known client ID
+  }
+  if (!clientId) {
+    clientId = '192992717479-ocaonobk699q4r97dsh8fqgj10dg0n7p.apps.googleusercontent.com';
   }
   res.json({
     clientId,

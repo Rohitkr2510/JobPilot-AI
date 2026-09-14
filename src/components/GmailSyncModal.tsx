@@ -323,6 +323,27 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
             )}
           </div>
 
+          {/* Localhost OAuth Hint Banner */}
+          {!isLinked && typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') && (
+            <div className="p-3.5 rounded-xl bg-blue-950/40 border border-blue-800/60 text-xs space-y-1.5">
+              <div className="flex items-center gap-2 font-semibold text-blue-300">
+                <AlertCircle className="w-4 h-4 text-blue-400 shrink-0" />
+                <span>Running JobPilot AI Locally on Localhost</span>
+              </div>
+              <p className="text-slate-300 text-[11px] leading-relaxed">
+                Google blocks OAuth on <code className="text-cyan-300 bg-slate-900 px-1.5 py-0.5 rounded border border-slate-700">http://localhost:3000</code> with <span className="text-amber-400 font-mono">origin_mismatch</span> because the default client ID is registered for cloud deployment.
+              </p>
+              <div className="pt-1 text-slate-300 text-[11px] space-y-1">
+                <p>
+                  ⚡ <strong>Recommended:</strong> Use the <span className="text-cyan-300 font-semibold">"Test Range Simulation"</span> button below to test DevOps job alert ingestion and Gemini AI parsing with zero setup.
+                </p>
+                <p className="text-slate-400 text-[10px]">
+                  🔑 <strong>To link your live Gmail:</strong> Create an OAuth Client ID in Google Cloud Console with <code className="text-slate-300">http://localhost:3000</code> as an Authorized JavaScript Origin, and set <code className="text-cyan-300 font-mono">GOOGLE_CLIENT_ID</code> in your <code className="text-slate-300">.env</code>.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Time Range Selector */}
           <div className="space-y-3 p-4 rounded-xl bg-slate-950/70 border border-slate-800">
             <div className="flex items-center justify-between">

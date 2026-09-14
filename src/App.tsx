@@ -491,6 +491,8 @@ export default function App() {
         {activeTab === 'workspace' && (
           <ApplicationWorkspaceView
             job={selectedJob}
+            jobs={jobs}
+            onSelectJob={handleSelectJob}
             masterProfile={masterProfile}
             latestResume={latestResume}
             onBackToJobs={() => setActiveTab('jobs')}
