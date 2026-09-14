@@ -1,0 +1,6 @@
+{
+  "name": "JobPilot AI - DevOps Job & Application Assistant",
+  "description": "Agentic AI platform for DevOps engineers: Gmail job alerts, JD analysis, hybrid matching, ATS-tailored resumes, application workspaces, cold emails, and application tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
