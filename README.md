@@ -16,6 +16,33 @@
 
 ---
 
+## 📸 Application Preview & Screenshots
+
+<div align="center">
+
+### 1. Command Center & Priority Action Queue
+*Central cockpit displaying ingested job alerts, AI match scores, priority actions, and multi-agent orchestrator telemetry.*
+
+<img src="docs/images/dashboard-command-center.png" alt="JobPilot AI Command Center" width="100%" />
+
+<br/>
+
+### 2. Application Workspace & 1-Page ATS Resume Engine
+*Dynamic workspace queue, 1-page ATS resume generator, 0-hallucination guardrails, and one-click PDF export.*
+
+<img src="docs/images/workspace-resume-builder.png" alt="JobPilot AI Workspace and Resume Builder" width="100%" />
+
+<br/>
+
+### 3. Analytics & Agent Observability Telemetry
+*Application conversion funnel, high-yield skill frequency, and live sub-second LLM execution telemetry.*
+
+<img src="docs/images/analytics-telemetry.png" alt="JobPilot AI Analytics and Telemetry" width="100%" />
+
+</div>
+
+---
+
 ## Key Features
 
 - 🎯 **AI Job Match & Scoring Engine**: Weighted multi-factor scoring (technical skills, cloud experience, CI/CD, seniority, and certifications) backed by Google Gemini with deterministic fallback heuristics.

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ROHIT_CANDIDATE_PROFILE, SEED_JOBS, DEFAULT_SCORING_WEIGHTS } from './data/masterProfile';
 import { JobOpportunity, JobStatus, MasterCandidateProfile, ScoringWeights, UploadedResumeRecord } from './types';
+import { isDuplicateJob, deduplicateJobList } from './utils/jobDeduplication';
 import { Navbar } from './components/Navbar';
 import { DashboardView } from './components/DashboardView';
 import { JobsExplorerView } from './components/JobsExplorerView';
@@ -407,20 +408,35 @@ export default function App() {
 
   // 6. On Ingest New Job
   const handleJobIngested = (newJob: JobOpportunity) => {
-    persistJobToSqlite(newJob);
-    setJobs(prev => [newJob, ...prev]);
-    setSelectedJobId(newJob.id);
-    setActiveTab('workspace');
-    showToast(`Job alert ingested: ${newJob.title} @ ${newJob.company} (${newJob.matchAnalysis?.overallScore || 85}% match)!`);
+    let existingFound: JobOpportunity | null = null;
+
+    setJobs(prev => {
+      const existing = prev.find(j => isDuplicateJob(j, newJob));
+      if (existing) {
+        existingFound = existing;
+        return prev.map(j => (j.id === existing.id ? { ...existing, ...newJob, id: existing.id } : j));
+      }
+      return [newJob, ...prev];
+    });
+
+    if (existingFound) {
+      const found = existingFound as JobOpportunity;
+      setSelectedJobId(found.id);
+      setActiveTab('workspace');
+      showToast(`Selected existing opportunity: ${found.company} - ${found.title}`, 'info');
+    } else {
+      persistJobToSqlite(newJob);
+      setSelectedJobId(newJob.id);
+      setActiveTab('workspace');
+      showToast(`Job alert ingested: ${newJob.title} @ ${newJob.company} (${newJob.matchAnalysis?.overallScore || 85}% match)!`, 'success');
+    }
   };
 
   // 7. On Jobs Imported from Gmail
   const handleJobsImportedFromGmail = (importedJobs: JobOpportunity[]) => {
     setJobs(prev => {
-      // Avoid duplicate IDs
-      const existingIds = new Set(prev.map(j => j.id));
-      const fresh = importedJobs.filter(j => !existingIds.has(j.id));
-      return [...fresh, ...prev];
+      const combined = [...importedJobs, ...prev];
+      return deduplicateJobList(combined);
     });
 
     if (importedJobs.length > 0) {

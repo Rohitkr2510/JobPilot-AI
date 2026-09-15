@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { ROHIT_CANDIDATE_PROFILE, SEED_JOBS, DEFAULT_RAW_RESUME_TEXT } from '../src/data/masterProfile';
 import { JobOpportunity, MasterCandidateProfile, UploadedResumeRecord } from '../src/types';
+import { cleanCompanyName, cleanJobTitle, isDuplicateJob } from '../src/utils/jobDeduplication';
 
 const DB_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DB_DIR)) {
@@ -187,6 +188,9 @@ export async function initDatabase(): Promise<void> {
     });
     console.log('[SQLite] Updated active uploaded resume in SQLite.');
   }
+
+  // Auto-deduplicate database on startup to clean duplicate entries and normalize legacy records
+  await deduplicateDatabaseJobs();
 
   // Clean start: No dummy jobs are seeded automatically.
   console.log(`[SQLite] Database initialized at: ${DB_FILE_PATH}`);
@@ -377,6 +381,14 @@ export async function getJobById(id: string): Promise<JobOpportunity | null> {
 export async function upsertJob(job: JobOpportunity): Promise<void> {
   const score = job.matchAnalysis?.overallScore || 0;
   const now = new Date().toISOString();
+  const sanitizedCompany = cleanCompanyName(job.company || 'Unknown');
+  const sanitizedTitle = cleanJobTitle(job.title || 'DevOps Engineer');
+
+  const normalizedJob: JobOpportunity = {
+    ...job,
+    company: sanitizedCompany,
+    title: sanitizedTitle,
+  };
 
   await dbClient.execute({
     sql: `
@@ -385,19 +397,105 @@ export async function upsertJob(job: JobOpportunity): Promise<void> {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM jobs WHERE id = ?), ?), ?)
     `,
     args: [
-      job.id,
-      job.company || 'Unknown',
-      job.title || 'DevOps Engineer',
-      job.location || 'Remote',
-      job.remoteType || 'Hybrid',
-      job.status || 'RECOMMENDED',
+      normalizedJob.id,
+      sanitizedCompany,
+      sanitizedTitle,
+      normalizedJob.location || 'Remote',
+      normalizedJob.remoteType || 'Hybrid',
+      normalizedJob.status || 'RECOMMENDED',
       score,
-      JSON.stringify(job),
-      job.id,
+      JSON.stringify(normalizedJob),
+      normalizedJob.id,
       now,
       now,
     ],
   });
+}
+
+/**
+ * Scans all jobs in the SQLite database, eliminates duplicate entries,
+ * merges statuses (e.g. APPLIED), sanitizes dirty company/title strings,
+ * and updates SQLite so that only unique entries exist.
+ */
+export async function deduplicateDatabaseJobs(): Promise<{ removedCount: number; cleanedCount: number; remainingCount: number }> {
+  try {
+    const res = await dbClient.execute('SELECT * FROM jobs ORDER BY updated_at DESC');
+    if (res.rows.length === 0) {
+      return { removedCount: 0, cleanedCount: 0, remainingCount: 0 };
+    }
+
+    const allJobs: JobOpportunity[] = [];
+    for (const row of res.rows) {
+      if (row.data) {
+        try {
+          const parsed = JSON.parse(row.data as string);
+          allJobs.push(parsed);
+        } catch {}
+      }
+    }
+
+    const uniqueJobs: JobOpportunity[] = [];
+    const idsToDelete: string[] = [];
+    let cleanedCount = 0;
+
+    for (const job of allJobs) {
+      const existingIndex = uniqueJobs.findIndex(u => isDuplicateJob(u, job));
+
+      if (existingIndex === -1) {
+        const cleanedComp = cleanCompanyName(job.company);
+        const cleanedTitle = cleanJobTitle(job.title);
+        if (cleanedComp !== job.company || cleanedTitle !== job.title) {
+          cleanedCount++;
+        }
+        uniqueJobs.push({
+          ...job,
+          company: cleanedComp,
+          title: cleanedTitle,
+        });
+      } else {
+        // It's a duplicate of an existing record in our unique list
+        const existing = uniqueJobs[existingIndex];
+        idsToDelete.push(job.id);
+
+        // Merge valuable data (e.g. status)
+        const hasBetterStatus = (job.status === 'APPLIED' || job.status === 'INTERVIEW' || job.status === 'OFFER') && existing.status !== 'APPLIED';
+        const hasDirectUrl = job.url && !job.url.includes('mail.google.com') && (!existing.url || existing.url.includes('mail.google.com'));
+
+        uniqueJobs[existingIndex] = {
+          ...existing,
+          status: hasBetterStatus ? job.status : existing.status,
+          appliedDate: job.appliedDate || existing.appliedDate,
+          url: hasDirectUrl ? job.url : existing.url,
+        };
+      }
+    }
+
+    // Delete redundant duplicate rows from database
+    for (const dupId of idsToDelete) {
+      await dbClient.execute({
+        sql: 'DELETE FROM jobs WHERE id = ?',
+        args: [dupId],
+      });
+    }
+
+    // Update sanitized/merged unique records
+    for (const uniqueJob of uniqueJobs) {
+      await upsertJob(uniqueJob);
+    }
+
+    if (idsToDelete.length > 0 || cleanedCount > 0) {
+      console.log(`[SQLite Deduplicator] Merged & removed ${idsToDelete.length} duplicate jobs, sanitized ${cleanedCount} company/title entries. Remaining unique jobs: ${uniqueJobs.length}`);
+    }
+
+    return {
+      removedCount: idsToDelete.length,
+      cleanedCount,
+      remainingCount: uniqueJobs.length,
+    };
+  } catch (err) {
+    console.error('[SQLite Deduplicator] Warning during database deduplication:', err);
+    return { removedCount: 0, cleanedCount: 0, remainingCount: 0 };
+  }
 }
 
 /**

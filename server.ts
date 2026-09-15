@@ -24,8 +24,15 @@ import {
   logGmailSync,
   getGmailSyncHistory,
   getDbStats,
+  deduplicateDatabaseJobs,
 } from './server/db';
 import { ROHIT_CANDIDATE_PROFILE } from './src/data/masterProfile';
+import {
+  cleanCompanyName,
+  cleanJobTitle,
+  isDuplicateJob,
+  deduplicateJobList,
+} from './src/utils/jobDeduplication';
 
 dotenv.config();
 
@@ -467,23 +474,25 @@ function generateFallbackIngest(rawText: string, sourceUrl: string) {
     }
   }
 
-  const matchAnalysis = calculateFallbackMatch(text, title, comp, null);
+  const cleanComp = cleanCompanyName(comp);
+  const cleanTitleStr = cleanJobTitle(title);
+  const matchAnalysis = calculateFallbackMatch(text, cleanTitleStr, cleanComp, null);
 
   return {
     id: `job-${Date.now()}`,
-    company: comp,
-    title: title,
+    company: cleanComp,
+    title: cleanTitleStr,
     location: location,
-    remoteType: location.toLowerCase().includes('remote') ? 'Remote' : 'Hybrid',
+    remoteType: (location.toLowerCase().includes('remote') ? 'Remote' : 'Hybrid') as 'Remote' | 'Hybrid' | 'On-site',
     salaryRange: salary,
-    url: sourceUrl || `https://careers.${comp.toLowerCase().replace(/[^a-z0-9]/g, '') || 'company'}.com/jobs/${Date.now()}`,
-    source: 'gmail_alert',
+    url: sourceUrl || `https://careers.${cleanComp.toLowerCase().replace(/[^a-z0-9]/g, '') || 'company'}.com/jobs/${Date.now()}`,
+    source: 'gmail_alert' as const,
     postedDate: new Date().toISOString().split('T')[0],
     discoveredDate: new Date().toISOString().split('T')[0],
     experienceRequired: exp,
-    employmentType: 'Full-time',
+    employmentType: 'Full-time' as const,
     description: text,
-    status: 'RECOMMENDED',
+    status: 'RECOMMENDED' as const,
     matchAnalysis: matchAnalysis,
   };
 }
@@ -945,19 +954,25 @@ Extract:
     };
 
     const parsed = await callGeminiSafe(prompt, schema, 'ingest-job-alert');
+    const existingJobs = await getAllJobs().catch(() => []);
+    const existingBackupJobs = await getBackupJobs().catch(() => []);
+    const allKnownJobs = [...existingJobs, ...existingBackupJobs];
 
     if (parsed && parsed.company && parsed.title) {
-      const matchAnalysis = calculateFallbackMatch(parsed.description || rawText, parsed.title, parsed.company, null);
+      const sanitizedCompany = cleanCompanyName(parsed.company);
+      const sanitizedTitle = cleanJobTitle(parsed.title);
+      const matchAnalysis = calculateFallbackMatch(parsed.description || rawText, sanitizedTitle, sanitizedCompany, null);
+      
       const newJob = {
         id: `job-${Date.now()}`,
-        company: parsed.company,
-        title: parsed.title,
+        company: sanitizedCompany,
+        title: sanitizedTitle,
         location: parsed.location || 'Bangalore, India',
         remoteType: (parsed.remoteType === 'Remote' || parsed.remoteType === 'On-site' ? parsed.remoteType : 'Hybrid') as any,
         salaryRange: parsed.salaryRange || 'Market Competitive',
         experienceRequired: parsed.experienceRequired || '2-5 years',
         employmentType: (parsed.employmentType === 'Contract' ? 'Contract' : 'Full-time') as any,
-        url: sourceUrl || `https://careers.${parsed.company.toLowerCase().replace(/[^a-z0-9]/g, '') || 'company'}.com/jobs/${Date.now()}`,
+        url: sourceUrl || `https://careers.${sanitizedCompany.toLowerCase().replace(/[^a-z0-9]/g, '') || 'company'}.com/jobs/${Date.now()}`,
         source: 'gmail_alert' as const,
         postedDate: new Date().toISOString().split('T')[0],
         discoveredDate: new Date().toISOString().split('T')[0],
@@ -966,24 +981,55 @@ Extract:
         matchAnalysis: matchAnalysis,
       };
 
+      const duplicate = allKnownJobs.find(j => isDuplicateJob(j, newJob));
+      if (duplicate) {
+        return res.json({
+          success: true,
+          job: duplicate,
+          extractedJob: duplicate,
+          isDuplicate: true,
+          message: `Job already exists in your workspace (${duplicate.company} - ${duplicate.title}). Selected existing opportunity.`,
+          mode: 'gemini_ai',
+        });
+      }
+
+      await upsertJob(newJob);
+
       return res.json({
         success: true,
         job: newJob,
         extractedJob: newJob,
+        isDuplicate: false,
         mode: 'gemini_ai',
       });
     }
 
     const fallbackJob = generateFallbackIngest(rawText, sourceUrl);
+    const duplicateFallback = allKnownJobs.find(j => isDuplicateJob(j, fallbackJob));
+    if (duplicateFallback) {
+      return res.json({
+        success: true,
+        job: duplicateFallback,
+        extractedJob: duplicateFallback,
+        isDuplicate: true,
+        message: `Job already exists in your workspace (${duplicateFallback.company} - ${duplicateFallback.title}). Selected existing opportunity.`,
+        mode: 'fallback_engine',
+      });
+    }
+
+    await upsertJob(fallbackJob);
+
     return res.json({
       success: true,
       job: fallbackJob,
       extractedJob: fallbackJob,
+      isDuplicate: false,
       mode: 'fallback_engine',
     });
   } catch (error: any) {
     console.error('Handled ingest-job-alert failure gracefully:', error);
     const fallbackJob = generateFallbackIngest(rawText, sourceUrl);
+    await upsertJob(fallbackJob);
     return res.json({
       success: true,
       job: fallbackJob,
@@ -1184,6 +1230,21 @@ app.post('/api/jobs/rescore-all', async (req, res) => {
       rescoredCount: rescoredJobs.length,
       jobs: rescoredJobs,
       message: `Successfully re-analyzed ${rescoredJobs.length} opportunities with multi-factor engine.`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/jobs/deduplicate', async (req, res) => {
+  try {
+    const stats = await deduplicateDatabaseJobs();
+    const uniqueJobs = await getAllJobs();
+    res.json({
+      success: true,
+      ...stats,
+      jobs: uniqueJobs,
+      message: `Deduplication complete. Removed ${stats.removedCount} duplicates, cleaned ${stats.cleanedCount} entries. Total unique jobs: ${stats.remainingCount}.`,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -1736,7 +1797,9 @@ Extract:
     title = titleMatch ? titleMatch[0] : 'DevOps Engineer';
   }
 
-  const matchAnalysis = calculateFallbackMatch(description, title, company, masterProfile);
+  const cleanCompany = cleanCompanyName(company);
+  const cleanTitleStr = cleanJobTitle(title);
+  const matchAnalysis = calculateFallbackMatch(description, cleanTitleStr, cleanCompany, masterProfile);
   
   let formattedDate = new Date().toISOString().split('T')[0];
   if (emailDateRaw) {
@@ -1752,14 +1815,14 @@ Extract:
 
   return {
     id: `job-gmail-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-    company,
-    title,
+    company: cleanCompany,
+    title: cleanTitleStr,
     location,
     remoteType: (remoteType === 'Remote' || remoteType === 'On-site' ? remoteType : 'Hybrid') as any,
     salaryRange,
     experienceRequired,
     employmentType: (employmentType === 'Contract' ? 'Contract' : 'Full-time') as any,
-    url: resolvedUrl || `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(company)}`,
+    url: resolvedUrl || `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(cleanCompany)}`,
     source: 'gmail_alert' as const,
     postedDate: formattedDate,
     discoveredDate: formattedDate,
@@ -1781,7 +1844,10 @@ app.post('/api/gmail/sync', async (req, res) => {
   } = req.body;
 
   const currentProfile = await getActiveProfile();
-  const existingJobs = await getAllJobs();
+  const existingActiveJobs = await getAllJobs().catch(() => []);
+  const existingBackupJobs = await getBackupJobs().catch(() => []);
+  const trackedJobs = [...existingActiveJobs, ...existingBackupJobs];
+  let duplicatesSkipped = 0;
   const { dateFilter, label: rangeLabel } = buildDateFilter(timeRange, startDate, endDate);
 
   const baseQuery = (query || '("job alert" OR "jobs for you" OR "devops" OR "cloud engineer" OR "site reliability" OR "sre" OR "applied" OR "application")').trim();
@@ -1864,11 +1930,18 @@ app.post('/api/gmail/sync', async (req, res) => {
     const newlyImported: any[] = [];
     for (const sim of matchingAlerts) {
       const extracted = await extractJobFromEmailText(sim.subject, sim.from, sim.body, currentProfile, sim.dateStr);
-      const exists = existingJobs.some(
-        j => j.company.toLowerCase() === extracted.company.toLowerCase() && j.title.toLowerCase() === extracted.title.toLowerCase()
-      );
-      if (!exists) {
+      const duplicate = trackedJobs.find(t => isDuplicateJob(t, extracted));
+
+      if (duplicate) {
+        duplicatesSkipped++;
+        // If existing job had a placeholder or generic URL and new alert has a direct URL, update it
+        if (extracted.url && !extracted.url.includes('mail.google.com') && (!duplicate.url || duplicate.url.includes('mail.google.com'))) {
+          duplicate.url = extracted.url;
+          await upsertJob(duplicate);
+        }
+      } else {
         await upsertJob(extracted);
+        trackedJobs.push(extracted);
         newlyImported.push(extracted);
       }
     }
@@ -1880,13 +1953,14 @@ app.post('/api/gmail/sync', async (req, res) => {
       jobsImported: newlyImported.length,
       query: `${effectiveQuery} [${rangeLabel}]`,
       status: 'SUCCESS',
-      details: `Simulated scan for range: ${rangeLabel}. Scanned ${matchingAlerts.length} emails, imported ${newlyImported.length} new opportunities.`,
+      details: `Simulated scan for range: ${rangeLabel}. Scanned ${matchingAlerts.length} alerts, imported ${newlyImported.length} unique opportunities, skipped ${duplicatesSkipped} duplicates.`,
     });
 
     return res.json({
       success: true,
       syncedCount: newlyImported.length,
       emailsScanned: matchingAlerts.length,
+      duplicatesSkipped,
       jobs: newlyImported,
       isSimulation: true,
       timeRange,
@@ -1930,6 +2004,7 @@ app.post('/api/gmail/sync', async (req, res) => {
         success: true,
         syncedCount: 0,
         emailsScanned: 0,
+        duplicatesSkipped: 0,
         jobs: [],
         timeRange,
         rangeLabel,
@@ -1987,12 +2062,17 @@ app.post('/api/gmail/sync', async (req, res) => {
         }
 
         const extracted = await extractJobFromEmailText(subject, from, bodyText, currentProfile, dateHeader, htmlText);
-        const exists = existingJobs.some(
-          j => j.company.toLowerCase() === extracted.company.toLowerCase() && j.title.toLowerCase() === extracted.title.toLowerCase()
-        );
+        const duplicate = trackedJobs.find(t => isDuplicateJob(t, extracted));
 
-        if (!exists) {
+        if (duplicate) {
+          duplicatesSkipped++;
+          if (extracted.url && !extracted.url.includes('mail.google.com') && (!duplicate.url || duplicate.url.includes('mail.google.com'))) {
+            duplicate.url = extracted.url;
+            await upsertJob(duplicate);
+          }
+        } else {
           await upsertJob(extracted);
+          trackedJobs.push(extracted);
           newlyImported.push(extracted);
         }
       } catch (innerErr) {
@@ -2007,13 +2087,14 @@ app.post('/api/gmail/sync', async (req, res) => {
       jobsImported: newlyImported.length,
       query: `${effectiveQuery} [${rangeLabel}]`,
       status: 'SUCCESS',
-      details: `Scanned ${emailsScanned} Gmail messages in range "${rangeLabel}" and imported ${newlyImported.length} new opportunities into SQLite.`,
+      details: `Scanned ${emailsScanned} Gmail messages in range "${rangeLabel}". Imported ${newlyImported.length} unique opportunities, skipped ${duplicatesSkipped} duplicates.`,
     });
 
     return res.json({
       success: true,
       syncedCount: newlyImported.length,
       emailsScanned,
+      duplicatesSkipped,
       jobs: newlyImported,
       timeRange,
       rangeLabel,
@@ -2022,6 +2103,436 @@ app.post('/api/gmail/sync', async (req, res) => {
   } catch (error: any) {
     console.error('Gmail sync failed:', error);
     return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/gmail/sync-stream', async (req, res) => {
+  const { 
+    accessToken, 
+    query, 
+    timeRange = '7d', 
+    startDate, 
+    endDate, 
+    maxResults = 15, 
+    isSimulation = false 
+  } = req.body;
+
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  if (typeof (res as any).flushHeaders === 'function') {
+    (res as any).flushHeaders();
+  }
+
+  const sendProgress = (data: any) => {
+    try {
+      res.write(JSON.stringify(data) + '\n');
+    } catch {}
+  };
+
+  sendProgress({
+    type: 'progress',
+    percent: 5,
+    step: 'init',
+    message: 'Initializing search query & retrieving profile...',
+    current: 0,
+    total: 0,
+    importedCount: 0,
+    duplicatesCount: 0,
+  });
+
+  const currentProfile = await getActiveProfile();
+  const existingActiveJobs = await getAllJobs().catch(() => []);
+  const existingBackupJobs = await getBackupJobs().catch(() => []);
+  const trackedJobs = [...existingActiveJobs, ...existingBackupJobs];
+  let duplicatesSkipped = 0;
+  const { dateFilter, label: rangeLabel } = buildDateFilter(timeRange, startDate, endDate);
+
+  const baseQuery = (query || '("job alert" OR "jobs for you" OR "devops" OR "cloud engineer" OR "site reliability" OR "sre" OR "applied" OR "application")').trim();
+  let effectiveQuery = baseQuery;
+  if (dateFilter && !baseQuery.includes('newer_than:') && !baseQuery.includes('after:') && !baseQuery.includes('before:')) {
+    effectiveQuery = `${baseQuery} ${dateFilter}`;
+  }
+
+  // Simulation mode
+  if (isSimulation || !accessToken) {
+    const nowMs = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const formatSimDate = (daysAgo: number) => new Date(nowMs - daysAgo * dayMs).toISOString().split('T')[0];
+
+    const simulatedAlertsPool = [
+      {
+        daysAgo: 0.2, // ~5 hours ago (Last 24h)
+        dateStr: formatSimDate(0.2),
+        subject: 'New DevOps Job Alert: Senior Cloud Infrastructure Engineer at Cisco',
+        from: 'jobalerts-noreply@linkedin.com',
+        body: 'Cisco is hiring a Senior Cloud Infrastructure Engineer in Bengaluru / Hybrid. Tech Stack: AWS, Terraform, Kubernetes (EKS), Jenkins CI/CD, Python scripting. 3+ years experience. Competitive compensation.\nApply directly here: https://www.linkedin.com/jobs/view/cisco-senior-cloud-infrastructure-engineer-blr-4491029',
+      },
+      {
+        daysAgo: 0.6, // ~14 hours ago (Last 24h)
+        dateStr: formatSimDate(0.6),
+        subject: 'Indeed Job Alert: Site Reliability & DevOps Specialist at Swiggy',
+        from: 'alert@indeed.com',
+        body: 'Swiggy Tech is looking for a DevOps/SRE Engineer. Responsibilities include managing Kubernetes clusters, automating CI/CD with Jenkins and Groovy, and implementing CloudWatch and Prometheus monitoring.\nView and apply: https://in.indeed.com/viewjob?jk=swiggy-sre-devops-bengaluru-901',
+      },
+      {
+        daysAgo: 2.1, // ~2 days ago (Last 3d, 1w)
+        dateStr: formatSimDate(2.1),
+        subject: 'LinkedIn Job Alert: Lead AWS Platform & DevSecOps Engineer at PhonePe',
+        from: 'jobalerts-noreply@linkedin.com',
+        body: 'PhonePe is seeking a Lead AWS Platform & DevSecOps Engineer. Responsibilities: Terraform modular infrastructure, Checkmarx security scans, automated rollback pipelines, and 99.99% cloud availability.\nDirect posting: https://www.linkedin.com/jobs/view/phonepe-lead-aws-devsecops-engineer-4482910',
+      },
+      {
+        daysAgo: 4.8, // ~5 days ago (Last 1w)
+        dateStr: formatSimDate(4.8),
+        subject: 'Naukri Alert: Senior CI/CD & Cloud Architect at Razorpay',
+        from: 'alerts@naukri.com',
+        body: 'Razorpay has an urgent opening for a Senior CI/CD & Cloud Architect. 3+ years experience with Jenkins Groovy Shared Libraries, AWS EKS, Prometheus telemetry, and zero-downtime deployment governance.\nApplication portal: https://www.naukri.com/job-listings-senior-cicd-cloud-architect-razorpay-bangalore-120926',
+      },
+      {
+        daysAgo: 9.5, // ~10 days ago (Last 2w, 1m)
+        dateStr: formatSimDate(9.5),
+        subject: 'Job Recommendation: Infrastructure Automation Engineer at Zepto',
+        from: 'talent@zepto.co',
+        body: 'Zepto is looking for an Infrastructure Automation Engineer. Deep hands-on experience in AWS EC2, S3, RDS, Docker containers, and reducing release cycle time through automated delivery workflows.\nApply at: https://boards.greenhouse.io/zepto/jobs/5918204',
+      },
+      {
+        daysAgo: 21.0, // ~21 days ago (Last 1m)
+        dateStr: formatSimDate(21.0),
+        subject: 'Recruiter Outreach: Site Reliability Engineer (Observability) at Flipkart',
+        from: 'sourcer@flipkart.com',
+        body: 'Flipkart Cloud team is expanding our SRE operations. We are looking for engineers with proven expertise in MTTR reduction, CloudWatch dashboards, Prometheus alerting, and Linux system debugging.\nRole specifications: https://www.flipkartcareers.com/job/site-reliability-engineer-bengaluru-44781',
+      },
+    ];
+
+    let matchingAlerts = simulatedAlertsPool;
+    if (timeRange === '24h' || timeRange === '1d') {
+      matchingAlerts = simulatedAlertsPool.filter(a => a.daysAgo <= 1.0);
+    } else if (timeRange === '3d') {
+      matchingAlerts = simulatedAlertsPool.filter(a => a.daysAgo <= 3.0);
+    } else if (timeRange === '7d' || timeRange === '1w') {
+      matchingAlerts = simulatedAlertsPool.filter(a => a.daysAgo <= 7.0);
+    } else if (timeRange === '14d' || timeRange === '2w') {
+      matchingAlerts = simulatedAlertsPool.filter(a => a.daysAgo <= 14.0);
+    } else if (timeRange === '30d' || timeRange === '1m') {
+      matchingAlerts = simulatedAlertsPool.filter(a => a.daysAgo <= 30.0);
+    } else if (timeRange === 'custom') {
+      matchingAlerts = simulatedAlertsPool.filter(a => {
+        if (startDate && a.dateStr < startDate) return false;
+        if (endDate && a.dateStr > endDate) return false;
+        return true;
+      });
+    }
+
+    sendProgress({
+      type: 'progress',
+      percent: 15,
+      step: 'query',
+      message: `Found ${matchingAlerts.length} simulated alerts for ${rangeLabel}...`,
+      current: 0,
+      total: matchingAlerts.length,
+      importedCount: 0,
+      duplicatesCount: 0,
+    });
+
+    const newlyImported: any[] = [];
+    const totalCount = matchingAlerts.length;
+
+    for (let i = 0; i < totalCount; i++) {
+      const sim = matchingAlerts[i];
+      const percent = Math.round(15 + ((i + 0.3) / totalCount) * 75);
+
+      sendProgress({
+        type: 'progress',
+        percent,
+        step: 'extracting',
+        message: `Analyzing alert ${i + 1} of ${totalCount}: ${sim.subject.slice(0, 45)}...`,
+        current: i + 1,
+        total: totalCount,
+        importedCount: newlyImported.length,
+        duplicatesCount: duplicatesSkipped,
+      });
+
+      const extracted = await extractJobFromEmailText(sim.subject, sim.from, sim.body, currentProfile, sim.dateStr);
+      const duplicate = trackedJobs.find(t => isDuplicateJob(t, extracted));
+
+      if (duplicate) {
+        duplicatesSkipped++;
+        if (extracted.url && !extracted.url.includes('mail.google.com') && (!duplicate.url || duplicate.url.includes('mail.google.com'))) {
+          duplicate.url = extracted.url;
+          await upsertJob(duplicate);
+        }
+      } else {
+        await upsertJob(extracted);
+        trackedJobs.push(extracted);
+        newlyImported.push(extracted);
+      }
+
+      sendProgress({
+        type: 'progress',
+        percent: Math.round(15 + ((i + 1) / totalCount) * 75),
+        step: 'analyzed',
+        message: duplicate
+          ? `Skipped duplicate alert: ${extracted.company} - ${extracted.title}`
+          : `Imported unique opportunity: ${extracted.company} - ${extracted.title}`,
+        current: i + 1,
+        total: totalCount,
+        importedCount: newlyImported.length,
+        duplicatesCount: duplicatesSkipped,
+      });
+    }
+
+    sendProgress({
+      type: 'progress',
+      percent: 95,
+      step: 'saving',
+      message: 'Logging sync run into SQLite database...',
+      current: totalCount,
+      total: totalCount,
+      importedCount: newlyImported.length,
+      duplicatesCount: duplicatesSkipped,
+    });
+
+    await logGmailSync({
+      id: `sync-sim-${Date.now()}`,
+      syncDate: new Date().toISOString(),
+      emailsScanned: matchingAlerts.length,
+      jobsImported: newlyImported.length,
+      query: `${effectiveQuery} [${rangeLabel}]`,
+      status: 'SUCCESS',
+      details: `Simulated scan for range: ${rangeLabel}. Scanned ${matchingAlerts.length} alerts, imported ${newlyImported.length} unique opportunities, skipped ${duplicatesSkipped} duplicates.`,
+    });
+
+    sendProgress({
+      type: 'complete',
+      percent: 100,
+      success: true,
+      syncedCount: newlyImported.length,
+      emailsScanned: matchingAlerts.length,
+      duplicatesSkipped,
+      jobs: newlyImported,
+      isSimulation: true,
+      timeRange,
+      rangeLabel,
+      effectiveQuery,
+      message: `Scan complete: ${newlyImported.length} unique opportunities imported, ${duplicatesSkipped} duplicates skipped.`,
+    });
+
+    return res.end();
+  }
+
+  // Real Gmail API scan with progress streaming
+  try {
+    sendProgress({
+      type: 'progress',
+      percent: 10,
+      step: 'gmail_query',
+      message: `Querying Gmail inbox for alerts matching "${effectiveQuery}"...`,
+      current: 0,
+      total: 0,
+      importedCount: 0,
+      duplicatesCount: 0,
+    });
+
+    const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(
+      effectiveQuery
+    )}&maxResults=${maxResults}`;
+
+    const listRes = await fetch(listUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!listRes.ok) {
+      const errText = await listRes.text();
+      sendProgress({
+        type: 'error',
+        percent: 0,
+        error: `Gmail API error (${listRes.status}): ${errText}`,
+      });
+      return res.end();
+    }
+
+    const listData = await listRes.json();
+    const messages = listData.messages || [];
+    const targetMessages = messages.slice(0, Number(maxResults) || 15);
+    const totalCount = targetMessages.length;
+
+    if (totalCount === 0) {
+      await logGmailSync({
+        id: `sync-${Date.now()}`,
+        syncDate: new Date().toISOString(),
+        emailsScanned: 0,
+        jobsImported: 0,
+        query: `${effectiveQuery} [${rangeLabel}]`,
+        status: 'NO_NEW_ALERTS',
+        details: `No job alert emails matching "${effectiveQuery}" in range "${rangeLabel}".`,
+      });
+
+      sendProgress({
+        type: 'complete',
+        percent: 100,
+        success: true,
+        syncedCount: 0,
+        emailsScanned: 0,
+        duplicatesSkipped: 0,
+        jobs: [],
+        timeRange,
+        rangeLabel,
+        effectiveQuery,
+        message: `No job alerts found matching query in ${rangeLabel}.`,
+      });
+      return res.end();
+    }
+
+    sendProgress({
+      type: 'progress',
+      percent: 15,
+      step: 'messages_found',
+      message: `Found ${totalCount} job alert emails in inbox. Beginning AI analysis...`,
+      current: 0,
+      total: totalCount,
+      importedCount: 0,
+      duplicatesCount: 0,
+    });
+
+    const newlyImported: any[] = [];
+    let emailsScanned = 0;
+
+    for (let i = 0; i < totalCount; i++) {
+      const msgRef = targetMessages[i];
+      emailsScanned++;
+      const percent = Math.round(15 + ((i + 0.3) / totalCount) * 75);
+
+      sendProgress({
+        type: 'progress',
+        percent,
+        step: 'fetching_email',
+        message: `Fetching & analyzing email ${i + 1} of ${totalCount}...`,
+        current: i + 1,
+        total: totalCount,
+        importedCount: newlyImported.length,
+        duplicatesCount: duplicatesSkipped,
+      });
+
+      try {
+        const detailRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgRef.id}?format=full`,
+          {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          }
+        );
+        if (!detailRes.ok) continue;
+
+        const detail = await detailRes.json();
+        const headers = detail.payload?.headers || [];
+        const subject =
+          headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value || 'Job Alert Notification';
+        const from =
+          headers.find((h: any) => h.name.toLowerCase() === 'from')?.value || 'alerts@jobplatform.com';
+        const dateHeader = headers.find((h: any) => h.name.toLowerCase() === 'date')?.value;
+        const snippet = detail.snippet || '';
+
+        let bodyText = snippet;
+        let htmlText = '';
+
+        const collectParts = (part: any) => {
+          if (!part) return;
+          if (part.mimeType === 'text/plain' && part.body?.data) {
+            try {
+              bodyText += ' ' + Buffer.from(part.body.data, 'base64').toString('utf-8');
+            } catch {}
+          } else if (part.mimeType === 'text/html' && part.body?.data) {
+            try {
+              htmlText += ' ' + Buffer.from(part.body.data, 'base64').toString('utf-8');
+            } catch {}
+          }
+          if (part.parts && Array.isArray(part.parts)) {
+            for (const child of part.parts) {
+              collectParts(child);
+            }
+          }
+        };
+
+        if (detail.payload) {
+          collectParts(detail.payload);
+        }
+
+        const extracted = await extractJobFromEmailText(subject, from, bodyText, currentProfile, dateHeader, htmlText);
+        const duplicate = trackedJobs.find(t => isDuplicateJob(t, extracted));
+
+        if (duplicate) {
+          duplicatesSkipped++;
+          if (extracted.url && !extracted.url.includes('mail.google.com') && (!duplicate.url || duplicate.url.includes('mail.google.com'))) {
+            duplicate.url = extracted.url;
+            await upsertJob(duplicate);
+          }
+        } else {
+          await upsertJob(extracted);
+          trackedJobs.push(extracted);
+          newlyImported.push(extracted);
+        }
+
+        sendProgress({
+          type: 'progress',
+          percent: Math.round(15 + ((i + 1) / totalCount) * 75),
+          step: 'analyzed',
+          message: duplicate
+            ? `Skipped duplicate: ${extracted.company} - ${extracted.title}`
+            : `Imported unique: ${extracted.company} - ${extracted.title} (${extracted.matchAnalysis?.overallScore || 85}% match)`,
+          current: i + 1,
+          total: totalCount,
+          importedCount: newlyImported.length,
+          duplicatesCount: duplicatesSkipped,
+        });
+      } catch (innerErr) {
+        console.error('Error processing single Gmail message:', innerErr);
+      }
+    }
+
+    sendProgress({
+      type: 'progress',
+      percent: 95,
+      step: 'saving',
+      message: 'Persisting sync history and updating job queue...',
+      current: totalCount,
+      total: totalCount,
+      importedCount: newlyImported.length,
+      duplicatesCount: duplicatesSkipped,
+    });
+
+    await logGmailSync({
+      id: `sync-${Date.now()}`,
+      syncDate: new Date().toISOString(),
+      emailsScanned,
+      jobsImported: newlyImported.length,
+      query: `${effectiveQuery} [${rangeLabel}]`,
+      status: 'SUCCESS',
+      details: `Scanned ${emailsScanned} Gmail messages in range "${rangeLabel}". Imported ${newlyImported.length} unique opportunities, skipped ${duplicatesSkipped} duplicates.`,
+    });
+
+    sendProgress({
+      type: 'complete',
+      percent: 100,
+      success: true,
+      syncedCount: newlyImported.length,
+      emailsScanned,
+      duplicatesSkipped,
+      jobs: newlyImported,
+      timeRange,
+      rangeLabel,
+      effectiveQuery,
+      message: `Completed scan of ${emailsScanned} emails. Imported ${newlyImported.length} unique jobs, skipped ${duplicatesSkipped} duplicates.`,
+    });
+
+    return res.end();
+  } catch (error: any) {
+    console.error('Gmail sync-stream failed:', error);
+    sendProgress({
+      type: 'error',
+      percent: 0,
+      error: error.message || 'Error occurred during streaming Gmail sync',
+    });
+    return res.end();
   }
 });
 

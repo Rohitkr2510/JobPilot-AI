@@ -52,6 +52,16 @@ const TIME_RANGE_PRESETS: TimeRangePreset[] = [
   { id: 'all', label: 'All Time', sublabel: 'Unfiltered', gmailFilter: 'No date limit' },
 ];
 
+interface ScanProgressState {
+  percent: number;
+  step: string;
+  message: string;
+  current: number;
+  total: number;
+  importedCount: number;
+  duplicatesCount: number;
+}
+
 export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
   isOpen,
   onClose,
@@ -76,10 +86,12 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
 
   const [maxResults, setMaxResults] = useState<number>(15);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [scanProgress, setScanProgress] = useState<ScanProgressState | null>(null);
   const [syncHistory, setSyncHistory] = useState<any[]>([]);
   const [syncResult, setSyncResult] = useState<{
     emailsScanned: number;
     syncedCount: number;
+    duplicatesSkipped?: number;
     jobs: JobOpportunity[];
     isSimulation?: boolean;
     timeRange?: string;
@@ -192,7 +204,7 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
     onToast('Gmail disconnected.', 'info');
   };
 
-  // Perform Sync
+  // Perform Sync with Real-Time Streaming Progress
   const handleSyncAlerts = async (isSimulation = false) => {
     // Validate custom dates if selected
     if (timeRange === 'custom' && startDate && endDate && startDate > endDate) {
@@ -202,9 +214,18 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
 
     setIsSyncing(true);
     setSyncResult(null);
+    setScanProgress({
+      percent: 5,
+      step: 'init',
+      message: isSimulation ? 'Initializing simulated inbox scan...' : 'Connecting to Gmail & applying filters...',
+      current: 0,
+      total: 0,
+      importedCount: 0,
+      duplicatesCount: 0,
+    });
 
     try {
-      const res = await fetch('/api/gmail/sync', {
+      const res = await fetch('/api/gmail/sync-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -218,32 +239,108 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
         }),
       });
 
-      const data = await res.json();
-
       if (!res.ok) {
-        if (res.status === 401 || data.error?.includes('401')) {
+        const errText = await res.text();
+        if (res.status === 401 || errText.includes('401')) {
           handleUnlink();
           throw new Error('Gmail token expired. Please link your Gmail account again.');
         }
-        throw new Error(data.error || 'Failed to sync job alerts');
+        throw new Error(`Sync failed (${res.status}): ${errText}`);
       }
 
-      setSyncResult(data);
+      if (res.body) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        let finalData: any = null;
 
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const event = JSON.parse(trimmed);
+              if (event.type === 'progress') {
+                setScanProgress({
+                  percent: Math.min(99, Math.max(5, event.percent || 0)),
+                  step: event.step || 'scanning',
+                  message: event.message || 'Scanning...',
+                  current: event.current || 0,
+                  total: event.total || 0,
+                  importedCount: event.importedCount || 0,
+                  duplicatesCount: event.duplicatesCount || 0,
+                });
+              } else if (event.type === 'complete') {
+                finalData = event;
+                setScanProgress({
+                  percent: 100,
+                  step: 'complete',
+                  message: event.message || 'Scan completed!',
+                  current: event.emailsScanned || 0,
+                  total: event.emailsScanned || 0,
+                  importedCount: event.syncedCount || 0,
+                  duplicatesCount: event.duplicatesSkipped || 0,
+                });
+              } else if (event.type === 'error') {
+                throw new Error(event.error || 'Sync error occurred');
+              }
+            } catch (jsonErr: any) {
+              if (jsonErr.message?.includes('Gmail token') || jsonErr.message?.includes('Sync error')) {
+                throw jsonErr;
+              }
+            }
+          }
+        }
+
+        if (finalData) {
+          setSyncResult(finalData);
+
+          if (finalData.jobs && finalData.jobs.length > 0) {
+            onJobsImported(finalData.jobs);
+            const dupText = finalData.duplicatesSkipped ? ` (${finalData.duplicatesSkipped} duplicate alerts skipped)` : '';
+            onToast(
+              `Imported ${finalData.jobs.length} unique DevOps job alert${finalData.jobs.length > 1 ? 's' : ''} for ${finalData.rangeLabel || timeRange}${dupText}!`,
+              'success'
+            );
+          } else {
+            const dupText = finalData.duplicatesSkipped ? ` (${finalData.duplicatesSkipped} duplicates skipped / already present)` : '';
+            onToast(`Scanned ${finalData.emailsScanned} emails in ${finalData.rangeLabel || timeRange}. All entries are unique / up to date${dupText}.`, 'info');
+          }
+
+          // Refresh sync history
+          const histRes = await fetch('/api/gmail/history');
+          const histData = await histRes.json();
+          if (histData.history) setSyncHistory(histData.history);
+          return;
+        }
+      }
+
+      // Fallback if stream was empty or unparsed
+      const fallbackRes = await fetch('/api/gmail/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accessToken: accessToken || '',
+          query: searchQuery,
+          timeRange,
+          startDate: timeRange === 'custom' ? startDate : undefined,
+          endDate: timeRange === 'custom' ? endDate : undefined,
+          maxResults,
+          isSimulation,
+        }),
+      });
+      const data = await fallbackRes.json();
+      setSyncResult(data);
       if (data.jobs && data.jobs.length > 0) {
         onJobsImported(data.jobs);
-        onToast(
-          `Imported ${data.jobs.length} new DevOps job alert${data.jobs.length > 1 ? 's' : ''} for ${data.rangeLabel || timeRange}!`,
-          'success'
-        );
-      } else {
-        onToast(`Scanned ${data.emailsScanned} emails in ${data.rangeLabel || timeRange}. No new unapplied alerts found.`, 'info');
       }
-
-      // Refresh sync history
-      const histRes = await fetch('/api/gmail/history');
-      const histData = await histRes.json();
-      if (histData.history) setSyncHistory(histData.history);
     } catch (err: any) {
       onToast(err.message || 'Error syncing Gmail alerts', 'error');
     } finally {
@@ -517,6 +614,55 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
             </button>
           </div>
 
+          {/* Real-time Scanning Progress Bar */}
+          {isSyncing && scanProgress && (
+            <div className="p-4 rounded-xl bg-slate-950/90 border border-blue-600/40 shadow-xl space-y-3 animate-in fade-in slide-in-from-top-2">
+              <div className="flex items-center justify-between text-xs">
+                <div className="flex items-center gap-2">
+                  <RefreshCw className="w-4 h-4 text-cyan-400 animate-spin shrink-0" />
+                  <span className="font-semibold text-slate-200">
+                    {scanProgress.message || 'Scanning emails...'}
+                  </span>
+                </div>
+                <span className="font-mono font-bold text-cyan-400 bg-cyan-950/80 px-2.5 py-0.5 rounded border border-cyan-800/60 text-xs">
+                  {scanProgress.percent}%
+                </span>
+              </div>
+
+              {/* Progress Bar Track */}
+              <div className="relative w-full h-3 bg-slate-900 rounded-full overflow-hidden border border-slate-800 p-0.5">
+                <div
+                  className="h-full bg-gradient-to-r from-blue-600 via-cyan-500 to-emerald-400 rounded-full transition-all duration-300 ease-out shadow-lg shadow-cyan-500/20 relative"
+                  style={{ width: `${Math.min(100, Math.max(5, scanProgress.percent))}%` }}
+                >
+                  <div className="absolute inset-0 bg-white/20 animate-pulse rounded-full" />
+                </div>
+              </div>
+
+              {/* Live Status Indicators & Counters */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px]">
+                <div className="flex items-center gap-2 text-slate-400">
+                  <span className="inline-block w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                  <span>
+                    {scanProgress.total > 0
+                      ? `Processing ${scanProgress.current} of ${scanProgress.total} emails`
+                      : 'Connecting & querying Gmail API...'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800/50 font-mono">
+                    +{scanProgress.importedCount} unique
+                  </span>
+                  {scanProgress.duplicatesCount > 0 && (
+                    <span className="text-amber-400 bg-amber-950/60 px-2 py-0.5 rounded border border-amber-800/50 font-mono">
+                      {scanProgress.duplicatesCount} duplicates filtered
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Sync Results Preview */}
           {syncResult && (
             <div className="p-4 rounded-xl bg-slate-950 border border-blue-900/50 space-y-3 animate-in fade-in">
@@ -526,7 +672,10 @@ export const GmailSyncModal: React.FC<GmailSyncModalProps> = ({
                   Sync Run Completed ({syncResult.rangeLabel || timeRange})
                 </span>
                 <span className="text-slate-400">
-                  {syncResult.emailsScanned} emails scanned • {syncResult.syncedCount} imported
+                  {syncResult.emailsScanned} emails scanned • {syncResult.syncedCount} unique imported
+                  {typeof syncResult.duplicatesSkipped === 'number' && syncResult.duplicatesSkipped > 0 && (
+                    <span className="text-amber-400 font-medium"> • {syncResult.duplicatesSkipped} duplicates skipped</span>
+                  )}
                 </span>
               </div>
 
